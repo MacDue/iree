@@ -159,6 +159,7 @@ def IREECodegen_LoweringConfigAttr :
 
   let assemblyFormat = [{
     `<` `tile_sizes` `=` $tileSizes
+      (`,` `scalable_tile_flags` `=` $scalableTileFlags^)?
       (`,` `tile_interchange` `=` $tileInterchange^)?
       (`,` `native_vector_size` `=` $nativeVectorSize^)? `>`
   }];
@@ -167,6 +168,8 @@ def IREECodegen_LoweringConfigAttr :
     AttrParameter<"ArrayAttr",
         "The tile sizes to use for different levels of tiling">:$tileSizes,
     DefaultValuedParameter<"ArrayAttr", "ArrayAttr::get($_ctxt, {})",
+        "A boolean array to flag the tile sizes at each level that are scalable">:$scalableTileFlags,
+    DefaultValuedParameter<"ArrayAttr", "ArrayAttr::get($_ctxt, {})",
         "The tile interchange to use for different levels of tiling">:$tileInterchange,
     DefaultValuedParameter<"ArrayAttr", "ArrayAttr::get($_ctxt, {})",
         "The native vector size to use for the given operation">:$nativeVectorSize
@@ -174,14 +177,24 @@ def IREECodegen_LoweringConfigAttr :
   let builders = [
     AttrBuilder<(ins "TileSizesListTypeRef":$tileSizes,
         CArg<"TileSizesListTypeRef", "{}">:$tileInterchange,
+        CArg<"ArrayRef<int64_t>", "{}">:$nativeVectorSize)>,
+    AttrBuilder<(ins "TileSizesListTypeRef":$tileSizes,
+        CArg<"ScalableTileFlagsListTypeRef">:$scalableTileFlags,
+        CArg<"TileSizesListTypeRef", "{}">:$tileInterchange,
         CArg<"ArrayRef<int64_t>", "{}">:$nativeVectorSize)>
   ];
   let extraClassDeclaration = [{
     // Returns the tile sizes for all levels set for the op.
     TileSizesListType getTileSizeVals();
 
+    // Returns the scalable tile flags for all levels set for the op.
+    ScalableTileFlagsListType getScalableTileFlagVals();
+
     // Returns the tile sizes for a level set for the op.
     SmallVector<int64_t> getTileSizeVals(unsigned level);
+
+    // Returns the scalable tile flags for a level set for the op.
+    SmallVector<bool> getScalableTileFlagVals(unsigned level);
 
     // Returns the tile interchange for a level set for the op.
     SmallVector<int64_t> getTileInterchangeVals(unsigned level);

@@ -75,7 +75,8 @@ static FailureOr<Operation *> getRootOp(Operation *op) {
 /// the vectorization tile sizes (parallel and reduction levels) out of the
 /// lowering config and adjusts them to the format expected by the Linalg
 /// vectorizer.
-static SmallVector<int64_t> getCanonicalVectorShape(func::FuncOp funcOp) {
+static std::pair<SmallVector<int64_t>, SmallVector<bool>>
+getCanonicalVectorShape(func::FuncOp funcOp) {
   FailureOr<Operation *> rootOp = getRootOp(funcOp);
   if (failed(rootOp)) {
     return {};
@@ -83,16 +84,26 @@ static SmallVector<int64_t> getCanonicalVectorShape(func::FuncOp funcOp) {
 
   unsigned numTileLevels =
       mlir::iree_compiler::getNumTileLevels(rootOp.value());
-  if (numTileLevels < 3) {
+  if (numTileLevels < 4) {
     return {};
   }
 
+  // HACK: Comment below says the last two levels are parallel, then reduction,
+  // but it does not seem to line up with KernelDispatch.cpp (line 905) that
+  // seems to add <parallel>, <reduction>, <null parallel>?
+  // Changed to -3 and -2 to work around this.
+
   // Retrieve the tile sizes from the last two tiling levels (parallel and
   // reduction) used for vectorization.
+
   SmallVector<int64_t> canonicalVectorShape =
-      mlir::iree_compiler::getTileSizes(rootOp.value(), numTileLevels - 2);
+      mlir::iree_compiler::getTileSizes(rootOp.value(), numTileLevels - 3);
   SmallVector<int64_t> reductionTileSizes =
-      mlir::iree_compiler::getTileSizes(rootOp.value(), numTileLevels - 1);
+      mlir::iree_compiler::getTileSizes(rootOp.value(), numTileLevels - 2);
+
+  SmallVector<bool> canonicalVectorScalableDims =
+      mlir::iree_compiler::getScalableTileFlags(rootOp.value(),
+                                                numTileLevels - 3);
 
   if (!reductionTileSizes.empty()) {
     assert(canonicalVectorShape.size() == reductionTileSizes.size() &&
@@ -108,7 +119,7 @@ static SmallVector<int64_t> getCanonicalVectorShape(func::FuncOp funcOp) {
 
   // Replace zeros in canonical vector shape to turn it into a valid shape.
   std::replace(canonicalVectorShape.begin(), canonicalVectorShape.end(), 0, 1);
-  return canonicalVectorShape;
+  return std::make_pair(canonicalVectorShape, canonicalVectorScalableDims);
 }
 
 /// Tries to infer the vector sizes from an IR using ValueBounds analysis.
@@ -147,9 +158,25 @@ inferVectorSizesFromIR(linalg::LinalgOp linalgOp) {
     for (auto operandDimPair : operandDimPairs) {
       Value operand = operandDimPair.first;
       unsigned operandDim = operandDimPair.second;
+
+      bool mayUseScalableVectorization = false;
       maybeDimBound = ValueBoundsConstraintSet::computeConstantBound(
           presburger::BoundType::UB, operand, operandDim,
-          /*stopCondition=*/nullptr, /*closedUB=*/true);
+          /*stopCondition=*/
+          [&](Value value, std::optional<int64_t>) {
+            if (value.getDefiningOp() &&
+                llvm::dyn_cast<vector::VectorScaleOp>(value.getDefiningOp())) {
+              mayUseScalableVectorization = true;
+              return true;
+            }
+            return false;
+          },
+          /*closedUB=*/true);
+
+      // Hack: Can't compute an accurate upper bound with vscale. Defer to the
+      // lowering config.
+      if (mayUseScalableVectorization)
+        return failure();
 
       if (succeeded(maybeDimBound)) {
         break;
@@ -171,14 +198,16 @@ inferVectorSizesFromIR(linalg::LinalgOp linalgOp) {
 
 // Give the canonical vector shape of a dispatch, returns the vector sizes for a
 // particular linalg op within that dispatch.
-static SmallVector<int64_t>
+static std::pair<SmallVector<int64_t>, SmallVector<bool>>
 getVectorSizes(linalg::LinalgOp linalgOp,
-               ArrayRef<int64_t> canonicalVectorShape) {
+               ArrayRef<int64_t> canonicalVectorShape,
+               ArrayRef<bool> canonicalVectorScalableDims) {
   // Try to infer the vector sizes from the IR. If it fails, try to get them
   // from the lowering config.
   auto inferredVectorSizes = inferVectorSizesFromIR(linalgOp);
   if (succeeded(inferredVectorSizes)) {
-    return *inferredVectorSizes;
+    SmallVector<bool> inferredScalableDims(inferredVectorSizes->size(), false);
+    return std::make_pair(*inferredVectorSizes, inferredScalableDims);
   }
 
   FailureOr<Operation *> rootOp = getRootOp(linalgOp);
@@ -202,13 +231,19 @@ getVectorSizes(linalg::LinalgOp linalgOp,
   // of the linalg op.
   SmallVector<int64_t> vecSize(
       canonicalVectorShape.take_front(linalgOp.getNumLoops()));
+  SmallVector<bool> vecScalableDims(
+      canonicalVectorScalableDims.take_front(linalgOp.getNumLoops()));
+  if (canonicalVectorScalableDims.size() != canonicalVectorShape.size()) {
+    vecScalableDims = SmallVector<bool>(vecSize.size(), false);
+  }
+
   for (auto [idx, val] : llvm::enumerate(linalgOp.getStaticLoopRanges())) {
     if (ShapedType::isDynamic(val))
       continue;
     vecSize[idx] = std::max(vecSize[idx], val);
   }
 
-  return vecSize;
+  return std::make_pair(vecSize, vecScalableDims);
 }
 
 static LogicalResult isWithinVectorSizeLimit(linalg::LinalgOp linalgOp,
@@ -249,8 +284,10 @@ void GenericVectorizationPass::runOnOperation() {
   MLIRContext *context = &getContext();
   auto funcOp = getOperation();
   SmallVector<int64_t> canonicalVectorShape;
+  SmallVector<bool> canonicalVectorScalableDims;
   if (enableVectorMasking) {
-    canonicalVectorShape = getCanonicalVectorShape(funcOp);
+    std::tie(canonicalVectorShape, canonicalVectorScalableDims) =
+        getCanonicalVectorShape(funcOp);
   }
 
   IRRewriter rewriter(context);
@@ -263,11 +300,15 @@ void GenericVectorizationPass::runOnOperation() {
   });
   for (auto op : candidates) {
     SmallVector<int64_t> vectorSizes;
+    SmallVector<bool> scalableVecDims;
     if (auto linalgOp = dyn_cast<linalg::LinalgOp>(op)) {
       // Do not vectorize the op if the vector size is greater than or eqaul
       // to limit.
       if (enableVectorMasking) {
-        vectorSizes.append(getVectorSizes(linalgOp, canonicalVectorShape));
+        auto [vectorSize, scalableDims] = getVectorSizes(
+            linalgOp, canonicalVectorShape, canonicalVectorScalableDims);
+        vectorSizes.append(vectorSize);
+        scalableVecDims.append(scalableDims);
         if (std::accumulate(vectorSizes.begin(), vectorSizes.end(), 1,
                             std::multiplies<int64_t>()) >= maxVectorSize)
           continue;
@@ -284,7 +325,6 @@ void GenericVectorizationPass::runOnOperation() {
       vectorSizes.append(ty.getShape().begin(), ty.getShape().end());
     }
 
-    SmallVector<bool> scalableVecDims(vectorSizes.size(), false);
     (void)linalg::vectorize(rewriter, op, vectorSizes, scalableVecDims,
                             vectorizeGatherAccesses);
   };

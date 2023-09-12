@@ -22,6 +22,8 @@ namespace iree_compiler {
 /// Typedef for tile sizes to use at different levels of tiling.
 using TileSizesListType = SmallVector<SmallVector<int64_t>>;
 using TileSizesListTypeRef = ArrayRef<SmallVector<int64_t>>;
+using ScalableTileFlagsListType = SmallVector<SmallVector<bool>>;
+using ScalableTileFlagsListTypeRef = ArrayRef<SmallVector<bool>>;
 } // namespace iree_compiler
 } // namespace mlir
 
@@ -107,6 +109,7 @@ getLoweringConfig(ArrayRef<Operation *> computeOps);
 /// `iree_codegen.lowering_config` attribute is set on it.
 SmallVector<int64_t> getTileSizes(Operation *op, unsigned level);
 SmallVector<Value> getTileSizes(OpBuilder &b, Operation *op, unsigned level);
+SmallVector<bool> getScalableTileFlags(Operation *op, unsigned level);
 
 /// Returns the number of tiling levels defined in the
 /// `iree_codegen.lowering_config` of this operation.
@@ -121,13 +124,15 @@ void setLoweringConfig(Operation *op, IREE::Codegen::LoweringConfigAttr config);
 /// translation.
 inline LogicalResult setOpConfigAndEntryPointFnTranslation(
     func::FuncOp entryPointFn, Operation *op, TileSizesListTypeRef tileSizes,
+    ScalableTileFlagsListTypeRef scalableTileFlags,
     IREE::Codegen::DispatchLoweringPassPipeline passPipeline,
     ArrayRef<int64_t> workgroupSize = {},
     std::optional<int64_t> subgroupSize = {},
     unsigned softwarePipelineDepth = 0,
     unsigned softwarePipelineStoreStage = 1) {
   MLIRContext *context = entryPointFn.getContext();
-  auto config = IREE::Codegen::LoweringConfigAttr::get(context, tileSizes);
+  auto config = IREE::Codegen::LoweringConfigAttr::get(context, tileSizes,
+                                                       scalableTileFlags);
   setLoweringConfig(op, config);
   if (failed(setDispatchConfig(entryPointFn, workgroupSize, subgroupSize)))
     return failure();
@@ -135,6 +140,18 @@ inline LogicalResult setOpConfigAndEntryPointFnTranslation(
       entryPointFn.getContext(), passPipeline, softwarePipelineDepth,
       softwarePipelineStoreStage);
   return setTranslationInfo(entryPointFn, translationInfo);
+}
+
+inline LogicalResult setOpConfigAndEntryPointFnTranslation(
+    func::FuncOp entryPointFn, Operation *op, TileSizesListTypeRef tileSizes,
+    IREE::Codegen::DispatchLoweringPassPipeline passPipeline,
+    ArrayRef<int64_t> workgroupSize = {},
+    std::optional<int64_t> subgroupSize = {},
+    unsigned softwarePipelineDepth = 0,
+    unsigned softwarePipelineStoreStage = 1) {
+  return setOpConfigAndEntryPointFnTranslation(
+      entryPointFn, op, tileSizes, {}, passPipeline, workgroupSize,
+      subgroupSize, softwarePipelineDepth, softwarePipelineStoreStage);
 }
 
 //===----------------------------------------------------------------------===//

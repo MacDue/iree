@@ -79,8 +79,7 @@ struct PrimitiveTypeConverter : public TypeConverter {
                                    type.getEncoding());
     });
     addConversion([&](VectorType type) {
-      return VectorType::get(type.getShape(),
-                             convertType(type.getElementType()));
+      return type.cloneWith({}, convertType(type.getElementType()));
     });
     addConversion([&](IREE::Util::PtrType ptrType) {
       return IREE::Util::PtrType::get(convertType(ptrType.getTargetType()));

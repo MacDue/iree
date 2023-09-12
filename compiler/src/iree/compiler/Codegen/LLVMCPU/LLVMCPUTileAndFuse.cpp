@@ -16,6 +16,7 @@
 #include "mlir/Dialect/SCF/Transforms/Patterns.h"
 #include "mlir/Dialect/SCF/Transforms/TileUsingInterface.h"
 #include "mlir/Dialect/SCF/Transforms/Transforms.h"
+#include "mlir/Dialect/Vector/IR/VectorOps.h"
 #include "mlir/IR/Iterators.h"
 #include "mlir/Pass/Pass.h"
 #include "mlir/Transforms/GreedyPatternRewriteDriver.h"
@@ -232,8 +233,10 @@ void LLVMCPUTileAndFusePass::runOnOperation() {
   // If `consumerOp` has its own lowering config, we prefer using it. Otherwise,
   // fallback to find a lowering_config from other operations.
   SmallVector<int64_t> tileSizes;
+  SmallVector<bool> tileScalableFlags;
   if (auto loweringConfig = getLoweringConfig(consumerOp)) {
     tileSizes = loweringConfig.getTileSizeVals(tilingLevel);
+    tileScalableFlags = loweringConfig.getScalableTileFlagVals(tilingLevel);
   } else {
     FailureOr<IREE::Codegen::LoweringConfigAttr> maybeLoweringConfig =
         getLoweringConfig(getComputeOps(funcOp));
@@ -243,20 +246,44 @@ void LLVMCPUTileAndFusePass::runOnOperation() {
       return;
     }
     tileSizes = maybeLoweringConfig.value().getTileSizeVals(tilingLevel);
+    tileScalableFlags =
+        maybeLoweringConfig.value().getScalableTileFlagVals(tilingLevel);
   }
 
   int numLoops = consumerOp.getLoopIteratorTypes().size();
   if (numLoops > tileSizes.size()) {
     tileSizes.append(numLoops - tileSizes.size(), 0);
+    tileScalableFlags.append(numLoops - tileSizes.size(), false);
   }
   tileSizes.resize(numLoops);
+  tileScalableFlags.resize(numLoops);
 
   if (llvm::all_of(tileSizes, [&](int64_t size) { return size == 0; })) {
     LLVM_DEBUG(llvm::dbgs() << "----- skip, all zeros -----\n");
     return;
   }
 
-  auto options = scf::SCFTilingOptions().setTileSizes(tileSizes);
+  auto options = scf::SCFTilingOptions();
+  if (!llvm::is_contained(tileScalableFlags, true)) {
+    options.setTileSizes(tileSizes);
+  } else {
+    options.setTileSizeComputationFunction(
+        [=](OpBuilder &b, Operation *op) -> SmallVector<Value> {
+          auto loc = op->getLoc();
+          return llvm::map_to_vector(
+              llvm::zip(tileSizes, tileScalableFlags), [&](auto pair) -> Value {
+                auto [t, isScalable] = pair;
+                Value size = b.create<arith::ConstantIndexOp>(loc, t);
+                if (isScalable) {
+                  Value vscale =
+                      b.create<vector::VectorScaleOp>(loc, b.getIndexType());
+                  size = b.create<arith::MulIOp>(loc, size, vscale);
+                }
+                return size;
+              });
+        });
+  }
+
   IRRewriter rewriter(context);
   if (failed(applyTileAndFuse(rewriter, consumerOp, options))) {
     LLVM_DEBUG(llvm::dbgs() << "----- tile and fuse failed -----\n");

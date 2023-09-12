@@ -27,9 +27,10 @@ namespace iree_compiler {
 // Utility function for common code patterns.
 //===----------------------------------------------------------------------===//
 
-static bool checkIntegerArrayAttr(ArrayAttr arrayAttr) {
-  return !llvm::any_of(
-      arrayAttr, [](Attribute attr) { return !llvm::isa<IntegerAttr>(attr); });
+template <typename Attr>
+static bool checkIsArrayOfAttr(ArrayAttr arrayAttr) {
+  return !llvm::any_of(arrayAttr,
+                       [](Attribute attr) { return !llvm::isa<Attr>(attr); });
 }
 
 /// Returns an `ArrayAttr` where each element is an `IntegerAttr` of `IndexType`
@@ -63,6 +64,26 @@ static SmallVector<int64_t> getIntegerVals(ArrayAttr arrayAttr) {
   SmallVector<int64_t> values(arrayAttr.size());
   for (auto [index, attr] : llvm::enumerate(arrayAttr)) {
     values[index] = llvm::cast<IntegerAttr>(attr).getInt();
+  }
+  return values;
+}
+
+/// Returns an `ArrayAttr` where each element is a `BoolAttr`.
+static ArrayAttr getBoolArrayAttr(MLIRContext *context, ArrayRef<bool> values) {
+  auto attrs = llvm::map_to_vector(values, [&context](bool value) -> Attribute {
+    return BoolAttr::get(context, value);
+  });
+  return ArrayAttr::get(context, attrs);
+}
+
+/// Assumes that `arrayAttr` is a list of `BoolAttr`s and returns the values
+/// in these attributes as a vector.
+static SmallVector<bool> getBoolVals(ArrayAttr arrayAttr) {
+  if (!arrayAttr)
+    return {};
+  SmallVector<bool> values(arrayAttr.size());
+  for (auto [index, attr] : llvm::enumerate(arrayAttr)) {
+    values[index] = llvm::cast<BoolAttr>(attr).getValue();
   }
   return values;
 }
@@ -130,21 +151,33 @@ LogicalResult TranslationInfoAttr::verify(
 // iree_codegen.lowering_config
 //===----------------------------------------------------------------------===//
 
+LoweringConfigAttr
+LoweringConfigAttr::get(MLIRContext *context, TileSizesListTypeRef tileSizes,
+                        ScalableTileFlagsListTypeRef scalableTileFlags,
+                        TileSizesListTypeRef tileInterchange,
+                        ArrayRef<int64_t> nativeVectorSize) {
+  auto attrList = [&](auto lst, auto mapper) {
+    return llvm::map_to_vector(
+        lst, [&](auto &sizes) -> Attribute { return mapper(context, sizes); });
+  };
+  ArrayAttr tileSizesAttr =
+      ArrayAttr::get(context, attrList(tileSizes, getI64IntegerArrayAttr));
+  ArrayAttr scalableTileFlagsAttr =
+      ArrayAttr::get(context, attrList(scalableTileFlags, getBoolArrayAttr));
+  ArrayAttr tileInterchangeAttr = ArrayAttr::get(
+      context, attrList(tileInterchange, getI64IntegerArrayAttr));
+  ArrayAttr nativeVectorSizeAttr =
+      getI64IntegerArrayAttr(context, nativeVectorSize);
+  return get(context, tileSizesAttr, scalableTileFlagsAttr, tileInterchangeAttr,
+             nativeVectorSizeAttr);
+}
+
 LoweringConfigAttr LoweringConfigAttr::get(MLIRContext *context,
                                            TileSizesListTypeRef tileSizes,
                                            TileSizesListTypeRef tileInterchange,
                                            ArrayRef<int64_t> nativeVectorSize) {
-  auto attrList = [&](TileSizesListTypeRef lst) {
-    return llvm::map_to_vector(lst, [&](ArrayRef<int64_t> sizes) -> Attribute {
-      return getI64IntegerArrayAttr(context, sizes);
-    });
-  };
-  ArrayAttr tileSizesAttr = ArrayAttr::get(context, attrList(tileSizes));
-  ArrayAttr tileInterchangeAttr =
-      ArrayAttr::get(context, attrList(tileInterchange));
-  ArrayAttr nativeVectorSizeAttr =
-      getI64IntegerArrayAttr(context, nativeVectorSize);
-  return get(context, tileSizesAttr, tileInterchangeAttr, nativeVectorSizeAttr);
+  return LoweringConfigAttr::get(context, tileSizes, {}, tileInterchange,
+                                 nativeVectorSize);
 }
 
 TileSizesListType LoweringConfigAttr::getTileSizeVals() {
@@ -159,11 +192,30 @@ TileSizesListType LoweringConfigAttr::getTileSizeVals() {
   return tileSizes;
 }
 
+ScalableTileFlagsListType LoweringConfigAttr::getScalableTileFlagVals() {
+  auto scalableTileFlagsAttr = getScalableTileFlags();
+  if (!scalableTileFlagsAttr)
+    return {};
+  ScalableTileFlagsListType scalableTileFlags;
+  for (auto attr : scalableTileFlagsAttr) {
+    auto vals = getBoolVals(llvm::cast<ArrayAttr>(attr));
+    scalableTileFlags.emplace_back(std::move(vals));
+  }
+  return scalableTileFlags;
+}
+
 SmallVector<int64_t> LoweringConfigAttr::getTileSizeVals(unsigned level) {
   ArrayAttr tileSizesAttr = getTileSizes();
   if (!tileSizesAttr || tileSizesAttr.size() <= level)
     return {};
   return getIntegerVals(llvm::cast<ArrayAttr>(tileSizesAttr[level]));
+}
+
+SmallVector<bool> LoweringConfigAttr::getScalableTileFlagVals(unsigned level) {
+  auto scalableTileFlagsAttr = getScalableTileFlags();
+  if (!scalableTileFlagsAttr || level > scalableTileFlagsAttr.size())
+    return {};
+  return getBoolVals(llvm::cast<ArrayAttr>(scalableTileFlagsAttr[level]));
 }
 
 SmallVector<int64_t>
@@ -183,28 +235,36 @@ SmallVector<int64_t> LoweringConfigAttr::getNativeVectorSizeVals() {
 
 LogicalResult
 LoweringConfigAttr::verify(function_ref<InFlightDiagnostic()> emitError,
-                           ArrayAttr tileSizes, ArrayAttr tileInterchange,
+                           ArrayAttr tileSizes, ArrayAttr scalableTileFlagsAttr,
+                           ArrayAttr tileInterchange,
                            ArrayAttr nativeVectorSize) {
   if (!tileSizes) {
     return emitError() << "expected tile_sizes to be specified (even is "
                           "specified as empty)";
   }
-  auto hasNonIntElems = [](ArrayAttr sizes) -> bool {
-    return llvm::any_of(sizes, [](Attribute attr) {
+  auto hasNonMatchingElemns = [](ArrayAttr sizes, auto predicate) -> bool {
+    return llvm::any_of(sizes, [predicate](Attribute attr) {
       auto arrayAttr = llvm::dyn_cast<ArrayAttr>(attr);
-      return !arrayAttr || !checkIntegerArrayAttr(arrayAttr);
+      return !arrayAttr || !predicate(arrayAttr);
     });
   };
-  if (hasNonIntElems(tileSizes)) {
+  if (hasNonMatchingElemns(tileSizes, checkIsArrayOfAttr<IntegerAttr>)) {
     return emitError()
            << "expected all elements of tile_sizes to be a list of integers";
   }
-  if (tileInterchange && hasNonIntElems(tileInterchange)) {
+  if (scalableTileFlagsAttr &&
+      hasNonMatchingElemns(scalableTileFlagsAttr,
+                           checkIsArrayOfAttr<BoolAttr>)) {
+    return emitError() << "expected all elements of scalable_tile_flags to be "
+                          "a list of booleans";
+  }
+  if (tileInterchange &&
+      hasNonMatchingElemns(tileInterchange, checkIsArrayOfAttr<IntegerAttr>)) {
     return emitError() << "expected all elements of tile_interchange to be a "
                           "list of integers";
   }
   if (nativeVectorSize) {
-    if (!checkIntegerArrayAttr(nativeVectorSize)) {
+    if (!checkIsArrayOfAttr<IntegerAttr>(nativeVectorSize)) {
       return emitError()
              << "expected native_vector_size to be a list of integer values";
     }
@@ -235,6 +295,7 @@ LogicalResult CompilationInfoAttr::verify(
   }
   if (failed(
           LoweringConfigAttr::verify(emitError, loweringConfig.getTileSizes(),
+                                     loweringConfig.getScalableTileFlags(),
                                      loweringConfig.getTileInterchange(),
                                      loweringConfig.getNativeVectorSize()))) {
     return failure();
@@ -249,7 +310,7 @@ LogicalResult CompilationInfoAttr::verify(
     return failure();
   }
   if (workgroupSize) {
-    if (!checkIntegerArrayAttr(workgroupSize)) {
+    if (!checkIsArrayOfAttr<IntegerAttr>(workgroupSize)) {
       return emitError() << "expected workgroup_size to be a list of integers";
     }
   }
@@ -362,10 +423,18 @@ SmallVector<int64_t> getTileSizes(Operation *op, unsigned level) {
     return {};
   return configAttr.getTileSizeVals(level);
 }
+
 SmallVector<Value> getTileSizes(OpBuilder &b, Operation *op, unsigned level) {
   return llvm::map_to_vector(getTileSizes(op, level), [&](int64_t t) -> Value {
     return b.create<arith::ConstantIndexOp>(op->getLoc(), t);
   });
+}
+
+SmallVector<bool> getScalableTileFlags(Operation *op, unsigned level) {
+  IREE::Codegen::LoweringConfigAttr configAttr = getLoweringConfig(op);
+  if (!configAttr)
+    return {};
+  return configAttr.getScalableTileFlagVals(level);
 }
 
 unsigned getNumTileLevels(Operation *op) {
