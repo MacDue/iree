@@ -2230,6 +2230,12 @@ adjustTileSizesForGenericOp(mlir::FunctionOpInterface entryPointFn,
   return success();
 }
 
+/// 2D scalable vectorization has very limited support, so can't be generally
+/// propagated.
+static bool opKnownToSupport2DScalableVectorization(Operation *op) {
+  return isa<linalg::MatmulOp, linalg::MatmulTransposeAOp, linalg::FillOp>(op);
+}
+
 /// Set the lowering configs for all the compute ops. The lowering config is
 /// already set on `rootOperation`. We will duplicate the tile sizes of
 /// distribution and common parallel dims to other compute ops (so they have
@@ -2298,9 +2304,14 @@ setLoweringConfigForComputeOps(mlir::FunctionOpInterface entryPointFn,
     // Multi-lowering config works only if all the operations can share the same
     // distribution and parallel tile sizes from the root op.
     auto iterTypes = cast<TilingInterface>(op).getLoopIteratorTypes();
+    int numScalableSizes = 0;
     for (auto [idx, iterType] : llvm::enumerate(iterTypes)) {
       if (idx >= parallelVecTileSizes.size())
         break;
+      if (parallelVecScalableTileSizes[idx])
+        ++numScalableSizes;
+      if (numScalableSizes >= 2 && !opKnownToSupport2DScalableVectorization(op))
+        return success();
       if (iterType == utils::IteratorType::parallel)
         continue;
       if (distTileSizes[idx] || parallelVecTileSizes[idx])
@@ -2337,8 +2348,7 @@ setLoweringConfigForComputeOps(mlir::FunctionOpInterface entryPointFn,
   // [[X1', Z1], [X2', Y2']]
   // which is the final parallel tile sizes for all ops.
   llvm::SmallDenseMap<Operation *, SmallVector<int64_t>> reductionTileSizeMap;
-  llvm::SmallDenseMap<Operation *, SmallVector<bool>>
-      reductionScalableFlagseMap;
+  llvm::SmallDenseMap<Operation *, SmallVector<bool>> reductionScalableFlagsMap;
   distTileSizes.resize(maxLoopNums);
   parallelVecTileSizes.resize(maxLoopNums);
   parallelVecScalableTileSizes.resize(maxLoopNums);
@@ -2367,7 +2377,7 @@ setLoweringConfigForComputeOps(mlir::FunctionOpInterface entryPointFn,
         return failure();
       }
       reductionTileSizeMap[op] = reductionTileSizes;
-      reductionScalableFlagseMap[op] = reductionScalableFlags;
+      reductionScalableFlagsMap[op] = reductionScalableFlags;
     }
   }
 
@@ -2454,7 +2464,7 @@ setLoweringConfigForComputeOps(mlir::FunctionOpInterface entryPointFn,
                 if (reductionTileSizeMap.contains(op)) {
                   tileSizesList.push_back(reductionTileSizeMap[op]);
                   scalableTileFlagsList.push_back(
-                      reductionScalableFlagseMap[op]);
+                      reductionScalableFlagsMap[op]);
                 } else {
                   tileSizesList.push_back(zeros);
                   scalableTileFlagsList.push_back(falseVec);
