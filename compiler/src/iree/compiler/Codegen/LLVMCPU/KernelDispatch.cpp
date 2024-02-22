@@ -2304,14 +2304,9 @@ setLoweringConfigForComputeOps(mlir::FunctionOpInterface entryPointFn,
     // Multi-lowering config works only if all the operations can share the same
     // distribution and parallel tile sizes from the root op.
     auto iterTypes = cast<TilingInterface>(op).getLoopIteratorTypes();
-    int numScalableSizes = 0;
     for (auto [idx, iterType] : llvm::enumerate(iterTypes)) {
       if (idx >= parallelVecTileSizes.size())
         break;
-      if (parallelVecScalableTileSizes[idx])
-        ++numScalableSizes;
-      if (numScalableSizes >= 2 && !opKnownToSupport2DScalableVectorization(op))
-        return success();
       if (iterType == utils::IteratorType::parallel)
         continue;
       if (distTileSizes[idx] || parallelVecTileSizes[idx])
@@ -2430,7 +2425,19 @@ setLoweringConfigForComputeOps(mlir::FunctionOpInterface entryPointFn,
       SmallVector<bool> falseVec(numLoops, 0);
       // No scalable tiling for the distribution
       scalableTileFlagsList.push_back(falseVec);
-      scalableTileFlagsList.push_back(commonVecScalableTileFlags);
+      auto opCommonVecScalableTileFlags = commonVecScalableTileFlags;
+      int numScalableSizes = 0;
+      for (bool &scalableFlag : llvm::reverse(opCommonVecScalableTileFlags)) {
+        if (scalableFlag)
+          ++numScalableSizes;
+        // HACK: If the op is not known to support 2D scalable vectorization
+        // disable all but the first parallel scalable dim.
+        if (numScalableSizes >= 2 &&
+            !opKnownToSupport2DScalableVectorization(op)) {
+          scalableFlag = false;
+        }
+      }
+      scalableTileFlagsList.push_back(opCommonVecScalableTileFlags);
       bool setUpOK =
           TypeSwitch<Operation *, bool>(op)
               .Case<tensor::PackOp>([&](auto packOp) {

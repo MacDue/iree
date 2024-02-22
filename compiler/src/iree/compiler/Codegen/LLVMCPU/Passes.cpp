@@ -641,6 +641,9 @@ static void addLowerToLLVMPasses(OpPassManager &passManager,
 
   if (enableAArch64SME) {
     // (Arith, Vector) -> ArmSME
+    passManager.addPass(mlir::arm_sme::createVectorLegalizationPass());
+    passManager.addNestedPass<func::FuncOp>(createCanonicalizerPass());
+    passManager.addNestedPass<func::FuncOp>(createCSEPass());
     passManager.addNestedPass<func::FuncOp>(
         mlir::createArithToArmSMEConversionPass());
     passManager.addNestedPass<func::FuncOp>(
