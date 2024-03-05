@@ -2426,17 +2426,18 @@ setLoweringConfigForComputeOps(mlir::FunctionOpInterface entryPointFn,
       // No scalable tiling for the distribution
       scalableTileFlagsList.push_back(falseVec);
       auto opCommonVecScalableTileFlags = commonVecScalableTileFlags;
-      int numScalableSizes = 0;
-      for (bool &scalableFlag : llvm::reverse(opCommonVecScalableTileFlags)) {
-        if (scalableFlag)
-          ++numScalableSizes;
-        // HACK: If the op is not known to support 2D scalable vectorization
-        // disable all but the first parallel scalable dim.
-        if (numScalableSizes >= 2 &&
-            !opKnownToSupport2DScalableVectorization(op)) {
-          scalableFlag = false;
-        }
-      }
+      // int numScalableSizes = 0;
+      // for (bool &scalableFlag : llvm::reverse(opCommonVecScalableTileFlags))
+      // {
+      //   if (scalableFlag)
+      //     ++numScalableSizes;
+      //   // HACK: If the op is not known to support 2D scalable vectorization
+      //   // disable all but the first parallel scalable dim.
+      //   if (numScalableSizes >= 2 &&
+      //       !opKnownToSupport2DScalableVectorization(op)) {
+      //     scalableFlag = false;
+      //   }
+      // }
       scalableTileFlagsList.push_back(opCommonVecScalableTileFlags);
       bool setUpOK =
           TypeSwitch<Operation *, bool>(op)

@@ -334,6 +334,8 @@ void addCPUBufferOpsTileAndVectorizePipeline(OpPassManager &passManager,
     options.enableVectorMasking = enableVectorMasking;
     options.vectorizeGatherAccesses = true;
     nestedModulePM.addNestedPass<func::FuncOp>(
+        createUnsupportedScalabilityToLoopsPass());
+    nestedModulePM.addNestedPass<func::FuncOp>(
         createGenericVectorizationPass(options));
     nestedModulePM.addNestedPass<func::FuncOp>(
         createOptimizeTensorInsertExtractSlicesPass());
@@ -412,6 +414,8 @@ void addMultiTilingExpertPassPipeline(
     options.vectorizePadding = true;
     options.vectorizeGatherAccesses = true;
     nestedModulePM.addNestedPass<func::FuncOp>(
+        createUnsupportedScalabilityToLoopsPass());
+    nestedModulePM.addNestedPass<func::FuncOp>(
         createGenericVectorizationPass(options));
     nestedModulePM.addNestedPass<func::FuncOp>(
         createOptimizeTensorInsertExtractSlicesPass());
@@ -475,6 +479,8 @@ void addConvTileAndDecomposeExpertPassPipeline(OpPassManager &passManager,
     options.enableVectorMasking = enableVectorMasking;
     options.vectorizePadding = true;
     options.vectorizeGatherAccesses = true;
+    nestedModulePM.addNestedPass<func::FuncOp>(
+        createUnsupportedScalabilityToLoopsPass());
     nestedModulePM.addNestedPass<func::FuncOp>(
         createGenericVectorizationPass(options));
     nestedModulePM.addNestedPass<func::FuncOp>(

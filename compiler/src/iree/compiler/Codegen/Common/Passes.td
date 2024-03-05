@@ -266,6 +266,13 @@ def FuseTensorPadWithConsumer :
   let constructor = "mlir::iree_compiler::createFuseTensorPadWithConsumerPass()";
 }
 
+def UnsupportedScalabilityToLoops :
+    InterfacePass<"iree-codegen-unsupported-scalability-to-loops", "mlir::FunctionOpInterface"> {
+  let summary = "TODO";
+  let constructor =
+      "mlir::iree_compiler::createUnsupportedScalabilityToLoopsPass()";
+}
+
 def GenericVectorization :
     InterfacePass<"iree-codegen-generic-vectorization", "mlir::FunctionOpInterface"> {
   let summary = "Pass to perform vectorization on tensor/linalg ops.";
