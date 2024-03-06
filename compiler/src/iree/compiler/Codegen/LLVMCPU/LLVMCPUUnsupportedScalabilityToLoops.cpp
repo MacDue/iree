@@ -5,59 +5,55 @@
 // SPDX-License-Identifier: Apache-2.0 WITH LLVM-exception
 
 #include "iree/compiler/Codegen/Common/TileSizeSelection.h"
-#include "iree/compiler/Codegen/Utils/Utils.h"
-#include "mlir/Dialect/SCF/IR/SCF.h"
-#include "mlir/Transforms/GreedyPatternRewriteDriver.h"
 
-#include "iree/compiler/Codegen/Common/PassDetail.h"
-#include "iree/compiler/Codegen/Common/Passes.h"
 #include "iree/compiler/Codegen/Common/TileSizeSelection.h"
-#include "mlir/Dialect/Affine/LoopUtils.h"
-#include "mlir/Dialect/Linalg/Transforms/Hoisting.h"
-#include "mlir/Dialect/Linalg/Transforms/Transforms.h"
-#include "mlir/Dialect/MemRef/Transforms/Passes.h"
+#include "iree/compiler/Codegen/LLVMCPU/PassDetail.h"
+#include "iree/compiler/Codegen/LLVMCPU/Passes.h"
+#include "iree/compiler/Codegen/LLVMCPU/Utils.h"
+#include "iree/compiler/Codegen/Utils/Utils.h"
 #include "mlir/Dialect/SCF/Utils/Utils.h"
-#include "mlir/Dialect/Vector/Transforms/LoweringPatterns.h"
-#include "mlir/Dialect/Vector/Transforms/VectorRewritePatterns.h"
-#include "mlir/Interfaces/ValueBoundsOpInterface.h"
 #include "mlir/Pass/Pass.h"
 #include "mlir/Transforms/GreedyPatternRewriteDriver.h"
 
-#define DEBUG_TYPE "iree-codegen-unsupported-scalability-to-loops"
+#define DEBUG_TYPE "iree-llvmcpu-unsupported-scalability-to-loops"
 #define VEC_DBGS() (llvm::dbgs() << '[' << DEBUG_TYPE << "] ")
 
 namespace mlir::iree_compiler {
 
 namespace {
 
-class UnsupportedScalabilityToLoopsPass
-    : public UnsupportedScalabilityToLoopsBase<
-          UnsupportedScalabilityToLoopsPass> {
+class LLVMCPUUnsupportedScalabilityToLoopsPass
+    : public LLVMCPUUnsupportedScalabilityToLoopsBase<
+          LLVMCPUUnsupportedScalabilityToLoopsPass> {
 public:
-  using UnsupportedScalabilityToLoopsBase::UnsupportedScalabilityToLoopsBase;
+  using LLVMCPUUnsupportedScalabilityToLoopsBase::
+      LLVMCPUUnsupportedScalabilityToLoopsBase;
 
   void getDependentDialects(DialectRegistry &registry) const override {
-    registry.insert<arith::ArithDialect, affine::AffineDialect,
-                    linalg::LinalgDialect, scf::SCFDialect,
-                    vector::VectorDialect>();
+    registry
+        .insert<arith::ArithDialect, linalg::LinalgDialect, scf::SCFDialect>();
   }
 
   void runOnOperation() override;
 };
 
-static bool opKnownToSupport2DScalableVectorization(Operation *op) {
+static bool opKnownToSupport2DScalableVectorizationWithArmSME(Operation *op) {
   return isa<linalg::MatmulOp, linalg::MatmulTransposeAOp, linalg::FillOp>(op);
 }
 
-constexpr int tilingLevel = 1;
-
 struct DropUnsupportedScalableDimsFromTilingInterfaceOps
     : public OpInterfaceRewritePattern<TilingInterface> {
-  using OpInterfaceRewritePattern::OpInterfaceRewritePattern;
+  DropUnsupportedScalableDimsFromTilingInterfaceOps(MLIRContext *context,
+                                                    bool assumeArmSME)
+      : OpInterfaceRewritePattern(context), assumeArmSME(assumeArmSME) {}
+
   LogicalResult matchAndRewrite(TilingInterface op,
                                 PatternRewriter &rewriter) const override {
-
-    if (opKnownToSupport2DScalableVectorization(op))
+    // This rewrite is currently only required for ArmSME (which is the only
+    // target that currently has some concept of 2D scalability).
+    auto targetAttr = IREE::HAL::ExecutableTargetAttr::lookup(op);
+    bool isArmSME = assumeArmSME || hasSMEFeature(targetAttr);
+    if (!isArmSME || opKnownToSupport2DScalableVectorizationWithArmSME(op))
       return failure();
 
     auto loweringConfigAttr = getLoweringConfig(op);
@@ -67,15 +63,22 @@ struct DropUnsupportedScalableDimsFromTilingInterfaceOps
     auto tileSizes = loweringConfigAttr.getTileSizeVals();
     auto scalableFlags = loweringConfigAttr.getScalableTileFlagVals();
 
-    if (tilingLevel >= tileSizes.size())
-      return failure();
+    // Drop scalable dimensions from leading tiling levels first (and leading
+    // dimensions within tiling levels). This works out as dropping scalability
+    // from leading dimensions of the vector type.
+    int64_t firstTilingLevelWithScalableDims = -1;
+    int64_t numScalableDims = 0;
+    for (auto [level, levelScalableFlags] : llvm::enumerate(scalableFlags)) {
+      numScalableDims += llvm::count(levelScalableFlags, true);
+      if (numScalableDims > 0 && firstTilingLevelWithScalableDims == -1)
+        firstTilingLevelWithScalableDims = level;
+    }
 
-    auto levelTileSizes = tileSizes[tilingLevel];
-    auto levelScalableFlags = scalableFlags[tilingLevel];
-
-    auto numScalableDims = llvm::count(levelScalableFlags, true);
     if (numScalableDims <= 1)
       return failure();
+
+    auto levelTileSizes = tileSizes[firstTilingLevelWithScalableDims];
+    auto levelScalableFlags = scalableFlags[firstTilingLevelWithScalableDims];
 
     SmallVector<int64_t> loopTileSizes;
     SmallVector<bool> newScalableFlags;
@@ -90,33 +93,37 @@ struct DropUnsupportedScalableDimsFromTilingInterfaceOps
       }
     }
 
+    // Re-tile the operation with some scalability dropped. This introduces
+    // loops for previously scalable vector/tile sizes.
     scf::SCFTilingOptions options{};
     setSCFTileSizes(options, op, loopTileSizes, {});
-
     auto tilingResult =
         scf::tileUsingSCF(rewriter, cast<TilingInterface>(op), options);
     if (failed(tilingResult))
       return failure();
 
-    scalableFlags[tilingLevel] = newScalableFlags;
+    // Update the lowering config of the new tiled operations.
+    scalableFlags[firstTilingLevelWithScalableDims] = newScalableFlags;
     auto newLoweringConfig = IREE::Codegen::LoweringConfigAttr::get(
         getContext(), tileSizes, scalableFlags);
-
     for (auto *newOp : tilingResult->tiledOps) {
       if (isa<TilingInterface>(newOp))
         setLoweringConfig(newOp, newLoweringConfig);
     }
 
     rewriter.replaceOp(op, tilingResult->replacements);
-
     return success();
   };
+
+private:
+  bool assumeArmSME{false};
 };
 
-void UnsupportedScalabilityToLoopsPass::runOnOperation() {
+void LLVMCPUUnsupportedScalabilityToLoopsPass::runOnOperation() {
   RewritePatternSet patterns(&getContext());
   patterns.add<DropUnsupportedScalableDimsFromTilingInterfaceOps>(
-      patterns.getContext());
+      patterns.getContext(), assumeArmSME);
+
   if (mlir::failed(mlir::applyPatternsAndFoldGreedily(getOperation(),
                                                       std::move(patterns)))) {
     signalPassFailure();
@@ -126,8 +133,8 @@ void UnsupportedScalabilityToLoopsPass::runOnOperation() {
 } // namespace
 
 std::unique_ptr<InterfacePass<mlir::FunctionOpInterface>>
-createUnsupportedScalabilityToLoopsPass() {
-  return std::make_unique<UnsupportedScalabilityToLoopsPass>();
+createLLVMCPUUnsupportedScalabilityToLoopsPass() {
+  return std::make_unique<LLVMCPUUnsupportedScalabilityToLoopsPass>();
 }
 
 } // namespace mlir::iree_compiler

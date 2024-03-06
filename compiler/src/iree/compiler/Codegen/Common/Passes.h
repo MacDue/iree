@@ -181,9 +181,6 @@ std::unique_ptr<InterfacePass<mlir::FunctionOpInterface>>
 createGenericVectorizationPass(const GenericVectorizationPassOptions &options);
 
 std::unique_ptr<InterfacePass<mlir::FunctionOpInterface>>
-createUnsupportedScalabilityToLoopsPass();
-
-std::unique_ptr<InterfacePass<mlir::FunctionOpInterface>>
 createOptimizeTensorInsertExtractSlicesPass();
 
 std::unique_ptr<InterfacePass<mlir::FunctionOpInterface>>

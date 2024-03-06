@@ -139,6 +139,17 @@ def LLVMCPUTileAndFuse :
   ];
 }
 
+def LLVMCPUUnsupportedScalabilityToLoops :
+    InterfacePass<"iree-llvmcpu-unsupported-scalability-to-loops", "mlir::FunctionOpInterface"> {
+  let summary = "TODO";
+  let constructor =
+      "mlir::iree_compiler::createLLVMCPUUnsupportedScalabilityToLoopsPass()";
+  let options = [
+    Option<"assumeArmSME", "assume-arm-sme", "bool", /*default=*/"false",
+      "Assume the current target is ArmSME (used for testing)">
+  ];
+}
+
 def LLVMCPUUnfuseFMAOps :
     InterfacePass<"iree-llvmcpu-unfuse-fma-pass", "mlir::FunctionOpInterface"> {
   let summary = "Convert llvm.fma into unfused mulf and addf ops";

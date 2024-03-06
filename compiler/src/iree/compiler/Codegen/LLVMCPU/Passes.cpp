@@ -334,8 +334,6 @@ void addCPUBufferOpsTileAndVectorizePipeline(OpPassManager &passManager,
     options.enableVectorMasking = enableVectorMasking;
     options.vectorizeGatherAccesses = true;
     nestedModulePM.addNestedPass<func::FuncOp>(
-        createUnsupportedScalabilityToLoopsPass());
-    nestedModulePM.addNestedPass<func::FuncOp>(
         createGenericVectorizationPass(options));
     nestedModulePM.addNestedPass<func::FuncOp>(
         createOptimizeTensorInsertExtractSlicesPass());
@@ -398,6 +396,10 @@ void addMultiTilingExpertPassPipeline(
     }
   }
 
+  if (enableAArch64SSVE)
+    nestedModulePM.addNestedPass<func::FuncOp>(
+        createLLVMCPUUnsupportedScalabilityToLoopsPass());
+
   if (enablePeeling) {
     nestedModulePM.addNestedPass<func::FuncOp>(createLLVMCPUPeelPass());
   }
@@ -413,8 +415,6 @@ void addMultiTilingExpertPassPipeline(
     options.enableVectorMasking = enableVectorMasking;
     options.vectorizePadding = true;
     options.vectorizeGatherAccesses = true;
-    nestedModulePM.addNestedPass<func::FuncOp>(
-        createUnsupportedScalabilityToLoopsPass());
     nestedModulePM.addNestedPass<func::FuncOp>(
         createGenericVectorizationPass(options));
     nestedModulePM.addNestedPass<func::FuncOp>(
@@ -479,8 +479,6 @@ void addConvTileAndDecomposeExpertPassPipeline(OpPassManager &passManager,
     options.enableVectorMasking = enableVectorMasking;
     options.vectorizePadding = true;
     options.vectorizeGatherAccesses = true;
-    nestedModulePM.addNestedPass<func::FuncOp>(
-        createUnsupportedScalabilityToLoopsPass());
     nestedModulePM.addNestedPass<func::FuncOp>(
         createGenericVectorizationPass(options));
     nestedModulePM.addNestedPass<func::FuncOp>(
