@@ -9,6 +9,7 @@
 #include "mlir/Dialect/Arith/Utils/Utils.h"
 #include "mlir/Dialect/Tensor/IR/Tensor.h"
 #include "mlir/Dialect/Utils/StaticValueUtils.h"
+#include "mlir/Dialect/Vector/IR/ScalableValueBoundsConstraintSet.h"
 #include "mlir/Dialect/Vector/IR/VectorOps.h"
 #include "mlir/Dialect/Vector/Transforms/VectorRewritePatterns.h"
 #include "mlir/IR/PatternMatch.h"
@@ -28,6 +29,17 @@ static bool areAllRankReducedLeadingDim(tensor::ExtractSliceOp extractOp,
       extractOp.getMixedSizes(), extractOp.getMixedStrides());
   return extractOp.getType().getShape().take_back(trailingRank) ==
          inferredType.getShape().take_back(trailingRank);
+}
+
+static bool noMaskOrAllTrueMask(Value mask) {
+  if (!mask)
+    return true;
+  DenseElementsAttr splatAttr;
+  if (!matchPattern(mask, m_Constant<DenseElementsAttr>(&splatAttr)) ||
+      !splatAttr.isSplat()) {
+    return false;
+  }
+  return splatAttr.getSplatValue<BoolAttr>().getValue();
 }
 
 namespace {
@@ -56,19 +68,35 @@ public:
   LogicalResult matchAndRewrite(vector::TransferReadOp xferOp,
                                 PatternRewriter &rewriter) const override {
     // TODO: support 0-d corner case.
-    if (xferOp.getTransferRank() == 0)
+    if (xferOp.getTransferRank() == 0) {
+      llvm::dbgs() << "A\n";
       return failure();
-    if (xferOp.hasOutOfBoundsDim())
+    }
+    if (xferOp.hasOutOfBoundsDim()) {
+      llvm::dbgs() << "B\n";
       return failure();
-    if (!xferOp.getPermutationMap().isMinorIdentity())
+    }
+    if (!xferOp.getPermutationMap().isMinorIdentity()) {
+      llvm::dbgs() << "C\n";
+
       return failure();
-    if (xferOp.getMask())
+    }
+    if (!noMaskOrAllTrueMask(xferOp.getMask())) {
+      llvm::dbgs() << "D\n";
+
       return failure();
+    }
     auto extractOp = xferOp.getSource().getDefiningOp<tensor::ExtractSliceOp>();
-    if (!extractOp)
+    if (!extractOp) {
+      llvm::dbgs() << "1\n";
+
       return failure();
-    if (!extractOp.hasUnitStride())
+    }
+    if (!extractOp.hasUnitStride()) {
+      llvm::dbgs() << "2\n";
+
       return failure();
+    }
 
     // Bail on illegal rank-reduction: we need to check that the rank-reduced
     // dims are exactly the leading dims. I.e. the following is illegal:
@@ -86,8 +114,11 @@ public:
     // ```
     // For this, check the trailing `vectorRank` dims of the extract_slice
     // result tensor match the trailing dims of the inferred result tensor.
-    if (!areAllRankReducedLeadingDim(extractOp, extractOp.getType().getRank()))
+    if (!areAllRankReducedLeadingDim(extractOp,
+                                     extractOp.getType().getRank())) {
+      llvm::dbgs() << "4\n";
       return failure();
+    }
 
     int64_t rankReduced =
         extractOp.getSourceType().getRank() - extractOp.getType().getRank();
@@ -155,14 +186,43 @@ public:
       return failure();
     if (xferOp.getVectorType().getRank() != xferOp.getShapedType().getRank())
       return failure();
-    if (xferOp.getMask())
+    if (!noMaskOrAllTrueMask(xferOp.getMask()))
       return failure();
     // Fold only if the TransferWriteOp completely overwrites the `source` with
     // a vector. I.e., the result of the TransferWriteOp is a new tensor whose
     // content is the data of the vector.
-    if (!llvm::equal(xferOp.getVectorType().getShape(),
-                     xferOp.getShapedType().getShape()))
-      return failure();
+    // if (!llvm::equal(xferOp.getVectorType().getShape(),
+    //                 ))
+    //   return failure();
+    int i = 0;
+    for (auto [vDim, s, sDim] :
+         llvm::zip_equal(xferOp.getVectorType().getShape(),
+                         xferOp.getVectorType().getScalableDims(),
+                         xferOp.getShapedType().getShape())) {
+      if (!s) {
+        if (vDim != sDim)
+          return failure();
+      } else {
+        if (sDim != ShapedType::kDynamic)
+          return failure();
+        auto bound =
+            vector::ScalableValueBoundsConstraintSet::computeScalableBound(
+                xferOp.getSource(), i,
+                /*vscaleMin=*/1,
+                /*vscaleMax=*/16, presburger::BoundType::UB);
+        if (failed(bound))
+          return failure();
+        auto size = bound->getSize();
+        if (failed(size))
+          return failure();
+        if (!size->scalable)
+          return failure();
+        if (size->baseSize != vDim)
+          return failure();
+      }
+      i++;
+    }
+
     if (!xferOp.getPermutationMap().isIdentity())
       return failure();
 
@@ -259,7 +319,8 @@ public:
           extractSliceOp, "expect the transfer.vector_write op to write into a "
                           "tensor.empty op");
     }
-    if (xferOp.getMask()) {
+
+    if (!noMaskOrAllTrueMask(xferOp.getMask())) {
       return failure();
     }
 

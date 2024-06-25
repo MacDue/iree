@@ -37,28 +37,32 @@ public:
 };
 
 void OptimizeTensorInsertExtractSlicesPass::runOnOperation() {
-  auto funcOp = getOperation();
-  linalg::hoistRedundantVectorTransfers(cast<func::FuncOp>(funcOp));
-  IRRewriter rewriter(funcOp->getContext());
-  // TODO: walking in some reverse / inside-out order would be more efficient
-  // and would capture more cases.
-  funcOp.walk(
-      [&](scf::ForOp forOp) { hoistLoopInvariantSubsets(rewriter, forOp); });
-  vector::transferOpflowOpt(rewriter, funcOp);
-  MLIRContext *context = &getContext();
+  for (int i = 0; i < 2; i++) {
 
-  LDBG("after hoisting redundant transfers on tensors\n" << funcOp);
+    auto funcOp = getOperation();
+    linalg::hoistRedundantVectorTransfers(cast<func::FuncOp>(funcOp));
+    IRRewriter rewriter(funcOp->getContext());
+    vector::elimateVectorMasks(rewriter, funcOp);
+    // TODO: walking in some reverse / inside-out order would be more efficient
+    // and would capture more cases.
+    funcOp.walk(
+        [&](scf::ForOp forOp) { hoistLoopInvariantSubsets(rewriter, forOp); });
+    vector::transferOpflowOpt(rewriter, funcOp);
+    MLIRContext *context = &getContext();
 
-  RewritePatternSet patterns(context);
-  populateVectorTransferTensorSliceTransforms(patterns);
-  scf::ForOp::getCanonicalizationPatterns(patterns, context);
-  vector::TransferWriteOp::getCanonicalizationPatterns(patterns, context);
-  if (failed(applyPatternsAndFoldGreedily(funcOp, std::move(patterns)))) {
-    return signalPassFailure();
+    LDBG("after hoisting redundant transfers on tensors\n" << funcOp);
+
+    RewritePatternSet patterns(context);
+    populateVectorTransferTensorSliceTransforms(patterns);
+    scf::ForOp::getCanonicalizationPatterns(patterns, context);
+    vector::TransferWriteOp::getCanonicalizationPatterns(patterns, context);
+    if (failed(applyPatternsAndFoldGreedily(funcOp, std::move(patterns)))) {
+      return signalPassFailure();
+    }
+
+    LDBG("after folding tensor.extract_slice and vector.transfer_read Ops \n"
+         << funcOp);
   }
-
-  LDBG("after folding tensor.extract_slice and vector.transfer_read Ops \n"
-       << funcOp);
 }
 
 } // namespace
