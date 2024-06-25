@@ -13,6 +13,7 @@
 #include "mlir/Dialect/Linalg/Transforms/Transforms.h"
 #include "mlir/Dialect/MemRef/Transforms/Passes.h"
 #include "mlir/Dialect/SCF/Utils/Utils.h"
+#include "mlir/Dialect/Vector/IR/ScalableValueBoundsConstraintSet.h"
 #include "mlir/Dialect/Vector/Transforms/LoweringPatterns.h"
 #include "mlir/Dialect/Vector/Transforms/VectorRewritePatterns.h"
 #include "mlir/Interfaces/ValueBoundsOpInterface.h"
@@ -29,6 +30,7 @@ namespace {
 struct VectorizationTileSizes {
   SmallVector<int64_t> destShape;
   SmallVector<int64_t> vectorSizes;
+  SmallVector<bool> vectorScalableFlags;
 };
 
 /// Returns a VectorizationTileSizes which contains the inferred bounded result
@@ -63,21 +65,25 @@ inferSizesFromIR(linalg::LinalgOp linalgOp, std::optional<OpResult> opResult) {
     // Trivial case: `dim` size is available in the operand type.
     int64_t dimSize = llvm::cast<ShapedType>(firstOperand.getType())
                           .getShape()[firstOperandDim];
+    bool dimScalable = false;
     if (!ShapedType::isDynamic(dimSize)) {
       result.vectorSizes.push_back(dimSize);
+      result.vectorScalableFlags.push_back(dimScalable);
       LLVM_DEBUG(VEC_DBGS() << "Inferred iteration size '" << dimSize
                             << "' for dimension '" << dim << "'\n");
       continue;
     }
 
     // Use ValueBounds analysis to infer `dim` size upper bound.
-    FailureOr<int64_t> maybeDimBound;
+    FailureOr<vector::ConstantOrScalableBound> maybeDimBound;
     for (auto operandDimPair : operandDimPairs) {
       Value operand = operandDimPair.first;
       unsigned operandDim = operandDimPair.second;
-      maybeDimBound = ValueBoundsConstraintSet::computeConstantBound(
-          presburger::BoundType::UB, {operand, operandDim},
-          /*stopCondition=*/nullptr, /*closedUB=*/true);
+      maybeDimBound =
+          vector::ScalableValueBoundsConstraintSet::computeScalableBound(
+              operand, operandDim,
+              /*vscaleMin=*/1,
+              /*vscaleMax=*/16, presburger::BoundType::UB);
 
       if (succeeded(maybeDimBound)) {
         break;
@@ -88,13 +94,25 @@ inferSizesFromIR(linalg::LinalgOp linalgOp, std::optional<OpResult> opResult) {
       return std::nullopt;
     }
 
-    dimSize = maybeDimBound.value();
+    auto maybeDimSize = maybeDimBound->getSize();
+    if (failed(maybeDimSize)) {
+      return std::nullopt;
+    }
+
+    dimSize = maybeDimSize->baseSize;
+    dimScalable = maybeDimSize->scalable;
     result.vectorSizes.push_back(dimSize);
+    result.vectorScalableFlags.push_back(dimScalable);
+
     LLVM_DEBUG(VEC_DBGS() << "Inferred iteration size '" << dimSize
+                          << (dimScalable ? " x vscale" : "")
                           << "' for dimension '" << dim << "'\n");
   }
 
   if (opResult) {
+    if (llvm::is_contained(result.vectorScalableFlags, true)) {
+      return std::nullopt;
+    }
     result.destShape = linalgOp.getIndexingMapMatchingResult(opResult.value())
                            .compose(result.vectorSizes);
   }
@@ -244,12 +262,14 @@ getVectorSizes(Operation *op, bool useConfiguredVectorSizes) {
 
   // Try to infer the vector sizes from the IR.
   std::optional<SmallVector<int64_t>> vectorSizes;
+  SmallVector<bool> scalableFlags;
   TypeSwitch<Operation *, void>(op)
       .Case<linalg::LinalgOp>([&](linalg::LinalgOp linalgOp) {
         std::optional<VectorizationTileSizes> result =
             inferSizesFromIR(linalgOp, /*opResult=*/std::nullopt);
         if (result) {
           vectorSizes = result->vectorSizes;
+          scalableFlags = result->vectorScalableFlags;
         }
       })
       .Case<tensor::PackOp, tensor::UnPackOp>([&](auto op) {
@@ -269,9 +289,8 @@ getVectorSizes(Operation *op, bool useConfiguredVectorSizes) {
       .Default([&](Operation *) {});
 
   if (vectorSizes) {
-    // This can't identify scalable flags, so pad them with `false`.
-    return std::make_pair(vectorSizes.value(),
-                          SmallVector<bool>(vectorSizes->size(), false));
+    scalableFlags.resize(vectorSizes->size());
+    return std::make_pair(vectorSizes.value(), scalableFlags);
   }
   return std::nullopt;
 }
